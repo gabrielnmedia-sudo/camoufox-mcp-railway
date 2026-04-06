@@ -120,8 +120,7 @@ function createServer(): McpServer {
       try {
         console.error(chalk.blue(`[Camoufox] Launching browser to browse: ${url}`));
 
-        const isLinux = process.platform === "linux";
-        const headlessMode = headless !== undefined ? headless : (isLinux ? "virtual" : true);
+        const headlessMode = headless ?? true;
         const osOptions = ["windows", "macos", "linux"];
         const selectedOS = os || osOptions[Math.floor(Math.random() * osOptions.length)];
         const effectiveProxy = resolveProxy(proxy);
