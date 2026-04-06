@@ -41,6 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -u 1001 myappuser
 USER myappuser
 WORKDIR /home/myappuser/app
+ENV NODE_ENV=production
 
 COPY --from=builder /app/package.json /app/package-lock.json* ./
 RUN npm ci --omit=dev
@@ -48,4 +49,5 @@ RUN npm ci --omit=dev
 COPY --from=builder --chown=myappuser:myappuser /app/dist ./dist
 COPY --from=builder --chown=myappuser:myappuser /root/.cache/camoufox /home/myappuser/.cache/camoufox
 
+EXPOSE 3000
 ENTRYPOINT ["xvfb-run", "-a", "--server-args=-screen 0 1280x1024x24", "node", "dist/index.js"]

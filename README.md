@@ -2,6 +2,41 @@
 
 An MCP (Model Context Protocol) server that provides browser automation capabilities using [Camoufox](https://github.com/daijro/camoufox) - a privacy-focused Firefox fork with advanced anti-detection features.
 
+## Railway Deployment
+
+This fork can run in two modes:
+
+- `stdio` for local desktop MCP setups
+- `Streamable HTTP` for Railway and other remote deployments
+
+If `PORT` is present, the server automatically starts in remote HTTP mode and exposes:
+
+- `POST /mcp` for MCP requests
+- `GET /health` for Railway healthchecks
+- `GET /` for basic service info
+
+### Railway Variables
+
+Set these in Railway:
+
+- `MCP_AUTH_TOKEN`: bearer token required by your remote MCP client
+- `MCP_HTTP_PATH`: optional, defaults to `/mcp`
+- `PROXY_URL`: optional full proxy URL such as `http://user:pass@host:port`
+- `PROXY_SERVER`: optional proxy host such as `http://host:port`
+- `PROXY_USERNAME`: optional proxy username
+- `PROXY_PASSWORD`: optional proxy password
+
+Use either `PROXY_URL` or `PROXY_SERVER` with optional credentials. If a request supplies its own proxy, that overrides the default env-based proxy.
+
+### Quick Railway Flow
+
+1. Fork this repo.
+2. Create a new Railway service from the GitHub repo.
+3. Deploy with the included `Dockerfile`.
+4. Add `MCP_AUTH_TOKEN` and your proxy variables in Railway.
+5. After deploy, verify `https://your-service.up.railway.app/health`.
+6. Point your remote MCP client at `https://your-service.up.railway.app/mcp` with `Authorization: Bearer <MCP_AUTH_TOKEN>`.
+
 ## Features
 
 - 🛡️ **Advanced Anti-Detection**: Rotating OS fingerprints, realistic cursor movements, and browser fingerprint spoofing
