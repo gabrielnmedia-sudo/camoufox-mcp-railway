@@ -9,6 +9,11 @@ This fork can run in two modes:
 - `stdio` for local desktop MCP setups
 - `Streamable HTTP` for Railway and other remote deployments
 
+This fork now supports both:
+
+- a simple one-shot `browse` tool
+- a Browser Use-style session workflow with persistent tabs and action tools
+
 If `PORT` is present, the server automatically starts in remote HTTP mode and exposes:
 
 - `POST /mcp` for MCP requests
@@ -21,10 +26,13 @@ Set these in Railway:
 
 - `MCP_AUTH_TOKEN`: bearer token required by your remote MCP client
 - `MCP_HTTP_PATH`: optional, defaults to `/mcp`
+- `PORT`: set to `3000` so Railway and the service agree on the target port
 - `PROXY_URL`: optional full proxy URL such as `http://user:pass@host:port`
 - `PROXY_SERVER`: optional proxy host such as `http://host:port`
 - `PROXY_USERNAME`: optional proxy username
 - `PROXY_PASSWORD`: optional proxy password
+- `SESSION_TTL_MS`: optional session lifetime in milliseconds, defaults to 30 minutes
+- `MAX_SESSIONS`: optional cap on concurrent browser sessions, defaults to 10
 
 Use either `PROXY_URL` or `PROXY_SERVER` with optional credentials. If a request supplies its own proxy, that overrides the default env-based proxy.
 
@@ -43,6 +51,9 @@ Use either `PROXY_URL` or `PROXY_SERVER` with optional credentials. If a request
 - 🔧 **Enhanced Parameters**: Configurable wait strategies, timeouts, viewport dimensions, and more
 - 🌐 **Cross-Platform**: Works on Windows, macOS, and Linux (including Docker)
 - 📸 **Screenshot Support**: Capture page screenshots alongside HTML content
+- 🧠 **Session-Based Browsing**: Persistent browser sessions for multi-step agent workflows
+- 🖱️ **Interactive Actions**: Click, fill, press, wait, inspect, and screenshot within the same session
+- 🤖 **High-Level Task Tool**: A `browser_task` tool for Browser Use-style flows, plus low-level fallback tools
 - 🚀 **Easy Integration**: Compatible with Claude Desktop, VS Code, Cursor, Windsurf, and more
 
 ## Requirements
@@ -212,7 +223,38 @@ npm install camoufox-mcp-server
 
 ## Usage
 
-Once configured, the Camoufox MCP server provides a `browse` tool that your AI assistant can use to navigate websites and retrieve content.
+Once configured, the Camoufox MCP server provides both one-shot and session-based tools.
+
+### Tool Overview
+
+- `browse`: Open a URL in an ephemeral session and return the page snapshot
+- `create_session`: Start a persistent browser session
+- `list_sessions`: See active sessions
+- `close_session`: Close a session
+- `goto`: Navigate an existing session to a new URL
+- `get_content`: Return the current page HTML plus structured page summary
+- `inspect_page`: Return page summary and interactive elements without the full HTML blob
+- `screenshot`: Capture a screenshot from the current session page
+- `click`: Click an element in the current session
+- `fill`: Fill an input in the current session
+- `press`: Send a keyboard key like `Enter` or `Tab`
+- `wait_for`: Wait for a selector or pause for a fixed duration
+- `browser_task`: Run a Browser Use-style high-level task in a session
+
+### Recommended Agent Flow
+
+For simple fetches:
+
+1. Use `browse`
+
+For real browsing tasks:
+
+1. `create_session`
+2. `goto`
+3. `inspect_page`
+4. `click` / `fill` / `press` / `wait_for`
+5. `get_content` or `screenshot`
+6. `close_session`
 
 ### Natural Language Triggers
 
