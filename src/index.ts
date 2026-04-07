@@ -54,7 +54,7 @@ interface SessionLaunchOptions {
   block_webgl?: boolean;
   disable_coop?: boolean;
   geoip?: boolean;
-  headless?: boolean;
+  headless?: boolean | "virtual";
 }
 
 interface BrowserSession {
@@ -89,22 +89,6 @@ const SESSION_TTL_MS = Number(process.env.SESSION_TTL_MS || 30 * 60 * 1000);
 const MAX_SESSIONS = Number(process.env.MAX_SESSIONS || 10);
 const sessions = new Map<string, BrowserSession>();
 
-const searchInputSelectors = [
-  "input[type='search']",
-  "input[name*='search' i]",
-  "input[id*='search' i]",
-  "input[placeholder*='search' i]",
-  "input[placeholder*='name' i]",
-  "input[name*='name' i]",
-  "input[id*='name' i]",
-];
-
-const searchButtonSelectors = [
-  "button[type='submit']",
-  "input[type='submit']",
-  "button[aria-label*='search' i]",
-  "button:has-text('Search')",
-];
 
 function getDefaultProxy(): string | ProxyConfig | undefined {
   const proxyUrl = process.env.PROXY_URL;
@@ -138,6 +122,10 @@ function updateLastUsed(session: BrowserSession): void {
 
 async function wait(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function humanDelay(min = 50, max = 300): Promise<void> {
+  await wait(min + Math.floor(Math.random() * (max - min)));
 }
 
 async function safeCloseSession(sessionId: string): Promise<boolean> {
@@ -189,7 +177,7 @@ async function createSession(options: SessionLaunchOptions = {}): Promise<Browse
   const selectedOS = options.os || osOptions[Math.floor(Math.random() * osOptions.length)];
   const browser = await Camoufox({
     os: [selectedOS],
-    headless: options.headless ?? true,
+    headless: options.headless ?? "virtual",
     humanize: options.humanize ?? true,
     geoip: options.geoip ?? true,
     ublock: true,
@@ -198,9 +186,9 @@ async function createSession(options: SessionLaunchOptions = {}): Promise<Browse
     block_webrtc: options.block_webrtc ?? true,
     disable_coop: options.disable_coop ?? false,
     locale: options.locale,
-    viewport: options.viewport,
+    viewport: options.viewport ?? { width: 1920, height: 1080 },
     proxy: resolveProxy(options.proxy),
-    enable_cache: options.enable_cache ?? false,
+    enable_cache: options.enable_cache ?? true,
     firefox_user_prefs: options.firefox_user_prefs,
     exclude_addons: options.exclude_addons,
     window: options.window,
@@ -291,12 +279,13 @@ async function getPageSnapshot(
     includeScreenshot?: boolean;
     fullPageScreenshot?: boolean;
     interactiveLimit?: number;
+    maxTextLength?: number;
   } = {},
 ): Promise<Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>> {
-  const { includeHtml = true, includeScreenshot = false, fullPageScreenshot = true, interactiveLimit = 25 } = options;
+  const { includeHtml = true, includeScreenshot = false, fullPageScreenshot = true, interactiveLimit = 25, maxTextLength = 10000 } = options;
   const title = await session.page.title();
   const url = session.page.url();
-  const bodyText = await session.page.evaluate(() => (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 3000));
+  const bodyText = await session.page.evaluate((max) => (document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, max), maxTextLength);
   const interactive = await inspectInteractiveElements(session.page, interactiveLimit);
   const html = includeHtml ? await session.page.content() : undefined;
 
@@ -328,127 +317,6 @@ async function getPageSnapshot(
   return content;
 }
 
-function extractUrl(task: string): string | undefined {
-  const match = task.match(/https?:\/\/\S+/i);
-  return match?.[0];
-}
-
-function extractSearchText(task: string): string | undefined {
-  const quoted = task.match(/["“](.+?)["”]/);
-  if (quoted?.[1]) {
-    return quoted[1];
-  }
-
-  const patterns = [
-    /search for (.+)$/i,
-    /look up (.+)$/i,
-    /find (.+)$/i,
-  ];
-
-  for (const pattern of patterns) {
-    const match = task.match(pattern);
-    if (match?.[1]) {
-      return match[1].trim();
-    }
-  }
-
-  return undefined;
-}
-
-async function trySelectors<T>(
-  page: PageInstance,
-  selectors: string[],
-  action: (selector: string) => Promise<T>,
-): Promise<{ selector: string; result: T } | undefined> {
-  for (const selector of selectors) {
-    try {
-      const result = await action(selector);
-      return { selector, result };
-    } catch {
-      continue;
-    }
-  }
-
-  return undefined;
-}
-
-async function runBrowserTask(
-  task: string,
-  options: {
-    sessionId?: string;
-    startUrl?: string;
-    timeout?: number;
-    screenshot?: boolean;
-    waitStrategy?: WaitStrategy;
-  },
-): Promise<{ sessionId: string; content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>; temporarySession: boolean }> {
-  const timeout = options.timeout ?? DEFAULT_TIMEOUT;
-  const waitStrategy = options.waitStrategy ?? DEFAULT_WAIT;
-  const temporarySession = !options.sessionId;
-  const session = options.sessionId ? getSession(options.sessionId) : await createSession();
-  const steps: string[] = [];
-
-  try {
-    const url = options.startUrl ?? extractUrl(task);
-    if (url) {
-      await navigateSession(session, url, waitStrategy, timeout);
-      steps.push(`Navigated to ${url}.`);
-    }
-
-    const searchText = extractSearchText(task);
-    if (searchText) {
-      const foundInput = await trySelectors(session.page, searchInputSelectors, async (selector) => {
-        await ensureSelector(session.page, selector, Math.min(timeout, 10_000));
-        await session.page.fill(selector, searchText);
-        return true;
-      });
-
-      if (foundInput) {
-        steps.push(`Filled search input using selector ${foundInput.selector}.`);
-
-        const foundButton = await trySelectors(session.page, searchButtonSelectors, async (selector) => {
-          await ensureSelector(session.page, selector, 5_000);
-          await session.page.click(selector);
-          return true;
-        });
-
-        if (foundButton) {
-          steps.push(`Clicked search button ${foundButton.selector}.`);
-        } else {
-          await session.page.keyboard.press("Enter");
-          steps.push("Pressed Enter to submit search.");
-        }
-
-        await wait(2_000);
-      } else {
-        steps.push("Could not find an obvious search input automatically.");
-      }
-    }
-
-    const snapshot = await getPageSnapshot(session, {
-      includeHtml: true,
-      includeScreenshot: options.screenshot ?? true,
-    });
-
-    const taskSummary = {
-      type: "text" as const,
-      text: [
-        `Session ID: ${session.id}`,
-        `Task: ${task}`,
-        `Steps:`,
-        ...steps.map((step, index) => `${index + 1}. ${step}`),
-      ].join("\n"),
-    };
-
-    return {
-      sessionId: session.id,
-      content: [taskSummary, ...snapshot],
-      temporarySession,
-    };
-  } finally {
-    updateLastUsed(session);
-  }
-}
 
 function sessionLaunchSchema() {
   return {
@@ -468,7 +336,7 @@ function sessionLaunchSchema() {
         password: z.string().optional(),
       }),
     ]).optional().describe("Optional per-session proxy configuration. Falls back to env proxy when omitted."),
-    enable_cache: z.boolean().optional().default(false).describe("Enable browser cache."),
+    enable_cache: z.boolean().optional().default(true).describe("Enable browser cache."),
     firefox_user_prefs: z.record(z.any()).optional().describe("Custom Firefox preferences."),
     exclude_addons: z.array(z.string()).optional().describe("Addons to exclude."),
     window: z.tuple([
@@ -480,7 +348,7 @@ function sessionLaunchSchema() {
     block_webgl: z.boolean().optional().default(false).describe("Block WebGL."),
     disable_coop: z.boolean().optional().default(false).describe("Disable COOP."),
     geoip: z.boolean().optional().default(true).describe("Auto-detect location from IP."),
-    headless: z.boolean().optional().default(true).describe("Run headless."),
+    headless: z.union([z.boolean(), z.literal("virtual")]).optional().default("virtual").describe("Headless mode: true=headless, false=headed (requires display), \"virtual\"=Xvfb virtual display (best anti-detection, default)."),
   };
 }
 
@@ -602,7 +470,7 @@ function createServer(): McpServer {
     {
       sessionId: z.string().describe("Existing session to inspect."),
       screenshot: z.boolean().optional().default(true),
-      interactiveLimit: z.number().min(1).max(100).optional().default(25),
+      interactiveLimit: z.number().min(1).max(200).optional().default(50),
     },
     async ({ sessionId, screenshot, interactiveLimit }) => {
       const session = getSession(sessionId);
@@ -642,11 +510,18 @@ function createServer(): McpServer {
       timeout: z.number().min(1000).max(300000).optional().default(DEFAULT_TIMEOUT),
       waitStrategy: z.enum(["domcontentloaded", "load", "networkidle"]).optional().default(DEFAULT_WAIT),
       screenshot: z.boolean().optional().default(true),
+      doubleClick: z.boolean().optional().default(false).describe("Double-click the element instead of single click."),
+      button: z.enum(["left", "right", "middle"]).optional().default("left").describe("Mouse button to use."),
     },
-    async ({ sessionId, selector, timeout, waitStrategy, screenshot }) => {
+    async ({ sessionId, selector, timeout, waitStrategy, screenshot, doubleClick, button }) => {
       const session = getSession(sessionId);
+      await humanDelay();
       await ensureSelector(session.page, selector, timeout);
-      await session.page.click(selector);
+      if (doubleClick) {
+        await session.page.dblclick(selector, { button });
+      } else {
+        await session.page.click(selector, { button });
+      }
       await wait(waitStrategy === "networkidle" ? 2_000 : 750);
       return {
         content: await getPageSnapshot(session, {
@@ -666,11 +541,20 @@ function createServer(): McpServer {
       timeout: z.number().min(1000).max(300000).optional().default(DEFAULT_TIMEOUT),
       screenshot: z.boolean().optional().default(true),
       submit: z.boolean().optional().default(false).describe("Press Enter after filling."),
+      humanize: z.boolean().optional().default(false).describe("Type character-by-character with random delays instead of setting the value directly."),
     },
-    async ({ sessionId, selector, value, timeout, screenshot, submit }) => {
+    async ({ sessionId, selector, value, timeout, screenshot, submit, humanize }) => {
       const session = getSession(sessionId);
+      await humanDelay();
       await ensureSelector(session.page, selector, timeout);
-      await session.page.fill(selector, value);
+      if (humanize) {
+        await session.page.click(selector);
+        await session.page.keyboard.press("Control+a");
+        await session.page.keyboard.press("Delete");
+        await session.page.type(selector, value, { delay: 80 + Math.floor(Math.random() * 50) });
+      } else {
+        await session.page.fill(selector, value);
+      }
       if (submit) {
         await session.page.press(selector, "Enter");
         await wait(1_000);
@@ -694,6 +578,7 @@ function createServer(): McpServer {
     },
     async ({ sessionId, key, screenshot }) => {
       const session = getSession(sessionId);
+      await humanDelay();
       await session.page.keyboard.press(key);
       await wait(750);
       return {
@@ -734,29 +619,220 @@ function createServer(): McpServer {
   );
 
   server.tool(
+    "type",
+    {
+      sessionId: z.string().describe("Existing session to act on."),
+      selector: z.string().describe("CSS selector of the input to type into."),
+      text: z.string().describe("Text to type character by character."),
+      delay: z.number().min(0).max(500).optional().default(80).describe("Base delay in ms between keystrokes (random jitter added)."),
+      clearFirst: z.boolean().optional().default(true).describe("Select all and delete existing content before typing."),
+      timeout: z.number().min(1000).max(300000).optional().default(DEFAULT_TIMEOUT),
+      screenshot: z.boolean().optional().default(true),
+    },
+    async ({ sessionId, selector, text, delay, clearFirst, timeout, screenshot }) => {
+      const session = getSession(sessionId);
+      await humanDelay();
+      await ensureSelector(session.page, selector, timeout);
+      await session.page.click(selector);
+      if (clearFirst) {
+        await session.page.keyboard.press("Control+a");
+        await session.page.keyboard.press("Delete");
+      }
+      await session.page.type(selector, text, { delay: delay + Math.floor(Math.random() * 50) });
+      return {
+        content: await getPageSnapshot(session, { includeHtml: true, includeScreenshot: screenshot }),
+      };
+    },
+  );
+
+  server.tool(
+    "select",
+    {
+      sessionId: z.string().describe("Existing session to act on."),
+      selector: z.string().describe("CSS selector of the <select> element."),
+      value: z.string().describe("Option value or visible label text to select."),
+      timeout: z.number().min(1000).max(300000).optional().default(DEFAULT_TIMEOUT),
+      screenshot: z.boolean().optional().default(true),
+    },
+    async ({ sessionId, selector, value, timeout, screenshot }) => {
+      const session = getSession(sessionId);
+      await humanDelay();
+      await ensureSelector(session.page, selector, timeout);
+      try {
+        await session.page.selectOption(selector, value);
+      } catch {
+        await session.page.selectOption(selector, { label: value });
+      }
+      return {
+        content: await getPageSnapshot(session, { includeHtml: true, includeScreenshot: screenshot }),
+      };
+    },
+  );
+
+  server.tool(
+    "scroll",
+    {
+      sessionId: z.string().describe("Existing session to act on."),
+      direction: z.enum(["up", "down"]).optional().default("down").describe("Scroll direction."),
+      amount: z.number().min(1).max(10000).optional().default(500).describe("Pixels to scroll (ignored if selector is set)."),
+      selector: z.string().optional().describe("If set, scroll this element into view instead of scrolling the page."),
+      screenshot: z.boolean().optional().default(true),
+    },
+    async ({ sessionId, direction, amount, selector, screenshot }) => {
+      const session = getSession(sessionId);
+      if (selector) {
+        await session.page.locator(selector).scrollIntoViewIfNeeded();
+      } else {
+        const delta = direction === "up" ? -amount : amount;
+        await session.page.mouse.wheel(0, delta);
+      }
+      await wait(500);
+      return {
+        content: await getPageSnapshot(session, { includeHtml: true, includeScreenshot: screenshot }),
+      };
+    },
+  );
+
+  server.tool(
+    "evaluate",
+    {
+      sessionId: z.string().describe("Existing session to act on."),
+      script: z.string().describe("JavaScript expression to evaluate in the page context. The return value is serialized to JSON."),
+      screenshot: z.boolean().optional().default(false),
+    },
+    async ({ sessionId, script, screenshot }) => {
+      const session = getSession(sessionId);
+      let result: unknown;
+      try {
+        result = await session.page.evaluate(script);
+      } catch (error) {
+        result = `Error: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      const resultText = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+      const snapshot = screenshot ? await getPageSnapshot(session, { includeHtml: false, includeScreenshot: true }) : [];
+      return {
+        content: [{ type: "text" as const, text: `Result:\n${resultText}` }, ...snapshot],
+      };
+    },
+  );
+
+  server.tool(
+    "hover",
+    {
+      sessionId: z.string().describe("Existing session to act on."),
+      selector: z.string().describe("CSS selector of the element to hover over."),
+      timeout: z.number().min(1000).max(300000).optional().default(DEFAULT_TIMEOUT),
+      screenshot: z.boolean().optional().default(true),
+    },
+    async ({ sessionId, selector, timeout, screenshot }) => {
+      const session = getSession(sessionId);
+      await humanDelay();
+      await ensureSelector(session.page, selector, timeout);
+      await session.page.hover(selector);
+      await wait(500);
+      return {
+        content: await getPageSnapshot(session, { includeHtml: true, includeScreenshot: screenshot }),
+      };
+    },
+  );
+
+  server.tool(
+    "dismiss_popup",
+    {
+      sessionId: z.string().describe("Existing session to act on."),
+      strategy: z.enum(["auto", "escape", "click_close"]).optional().default("auto").describe("Dismissal strategy: auto tries multiple methods, escape presses Escape, click_close tries common close button selectors."),
+      selector: z.string().optional().describe("Specific close button selector to click (overrides strategy)."),
+      screenshot: z.boolean().optional().default(true),
+    },
+    async ({ sessionId, strategy, selector, screenshot }) => {
+      const session = getSession(sessionId);
+      const steps: string[] = [];
+
+      if (selector) {
+        try {
+          await ensureSelector(session.page, selector, 5000);
+          await session.page.click(selector);
+          steps.push(`Clicked custom selector: ${selector}`);
+        } catch {
+          steps.push(`Custom selector not found: ${selector}`);
+        }
+      } else {
+        const closeSelectors = [
+          "#onetrust-accept-btn-handler",
+          "[aria-label*='close' i]",
+          "[aria-label*='dismiss' i]",
+          "[aria-label*='accept' i]",
+          "button:has-text('Accept all')",
+          "button:has-text('Accept cookies')",
+          "button:has-text('Accept')",
+          "button:has-text('Got it')",
+          "button:has-text('OK')",
+          "button:has-text('Close')",
+          "button:has-text('Dismiss')",
+          "button:has-text('No thanks')",
+          ".modal-close",
+          ".close-button",
+          "[data-dismiss='modal']",
+          "[data-testid*='close' i]",
+        ];
+
+        if (strategy === "escape" || strategy === "auto") {
+          await session.page.keyboard.press("Escape");
+          await wait(300);
+          steps.push("Pressed Escape.");
+        }
+
+        if (strategy === "click_close" || strategy === "auto") {
+          for (const sel of closeSelectors) {
+            try {
+              await session.page.waitForSelector(sel, { timeout: 1500, state: "visible" });
+              await session.page.click(sel);
+              steps.push(`Clicked close button: ${sel}`);
+              await wait(500);
+              break;
+            } catch {
+              continue;
+            }
+          }
+        }
+      }
+
+      return {
+        content: [
+          { type: "text" as const, text: `Dismiss popup steps:\n${steps.map((s, i) => `${i + 1}. ${s}`).join("\n")}` },
+          ...await getPageSnapshot(session, { includeHtml: false, includeScreenshot: screenshot }),
+        ],
+      };
+    },
+  );
+
+  server.tool(
     "browser_task",
     {
-      sessionId: z.string().optional().describe("Optional existing session. If omitted, a temporary session is created."),
-      startUrl: z.string().optional().describe("Optional page to open before attempting the task."),
-      task: z.string().describe("High-level browser task such as 'Open example.com and search for John Doe'."),
+      sessionId: z.string().optional().describe("Optional existing session. If omitted, a temporary session is created and closed after the task."),
+      startUrl: z.string().optional().describe("Optional URL to navigate to before returning the snapshot."),
+      task: z.string().describe("Description of the task (informational — used as a label in the response). Use individual tools like type, click, select, etc. to interact with the page."),
       timeout: z.number().min(5000).max(300000).optional().default(DEFAULT_TIMEOUT),
       waitStrategy: z.enum(["domcontentloaded", "load", "networkidle"]).optional().default(DEFAULT_WAIT),
       screenshot: z.boolean().optional().default(true),
     },
     async ({ sessionId, startUrl, task, timeout, waitStrategy, screenshot }) => {
-      const result = await runBrowserTask(task, {
-        sessionId,
-        startUrl,
-        timeout,
-        waitStrategy,
-        screenshot,
-      });
+      const temporarySession = !sessionId;
+      const session = sessionId ? getSession(sessionId) : await createSession();
 
       try {
-        return { content: result.content };
+        if (startUrl) {
+          await navigateSession(session, startUrl, waitStrategy, timeout);
+        }
+
+        const snapshot = await getPageSnapshot(session, { includeHtml: true, includeScreenshot: screenshot });
+        const header = { type: "text" as const, text: `Session ID: ${session.id}\nTask: ${task}` };
+
+        return { content: [header, ...snapshot] };
       } finally {
-        if (result.temporarySession) {
-          await safeCloseSession(result.sessionId);
+        updateLastUsed(session);
+        if (temporarySession) {
+          await safeCloseSession(session.id);
         }
       }
     },

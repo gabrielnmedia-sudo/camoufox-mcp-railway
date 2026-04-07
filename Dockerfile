@@ -1,53 +1,57 @@
-# Force AMD64 platform even on ARM64 hosts
-FROM --platform=linux/amd64 node:20-bullseye AS builder
+# Force AMD64 — Camoufox only ships AMD64 binaries
+FROM --platform=linux/amd64 python:3.12-slim-bookworm AS builder
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    build-essential \
-    git \
+    curl wget git build-essential \
+    # Firefox runtime deps
+    libgtk-3-0 libx11-xcb1 libxfixes3 libxrandr2 libxtst6 libx11-6 \
+    libxcomposite1 libasound2 libdbus-glib-1-2 libnss3 libatk1.0-0 \
+    libatk-bridge2.0-0 libcups2 libdrm2 libgbm1 libatspi2.0-0 libxss1 \
+    # Xvfb for virtual display
+    xvfb xauth \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Copy package files
-COPY package.json package-lock.json* ./
+# Install Python deps
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Install dependencies (will use AMD64 binaries)
-RUN npm ci
+# Install Playwright Firefox
+RUN python -m playwright install firefox
+RUN python -m playwright install-deps firefox
 
-# Copy source code
-COPY . .
+# Fetch Camoufox browser binary
+RUN python -m camoufox fetch
 
-# Build TypeScript
-RUN npm run build
+# Copy server
+COPY server.py .
 
-# Install camoufox globally (AMD64 version)
-RUN npm install -g camoufox@0.1.2
-
-# Fetch the browser (AMD64 version)
-RUN camoufox fetch
-
-# Runtime stage - also forced to AMD64
-FROM --platform=linux/amd64 node:20-bullseye-slim AS runtime
+# ---- Runtime stage ----
+FROM --platform=linux/amd64 python:3.12-slim-bookworm AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgtk-3-0 libx11-xcb1 libxfixes3 libxrandr2 libxtst6 libx11-6 \
+    libxcomposite1 libasound2 libdbus-glib-1-2 libnss3 libatk1.0-0 \
+    libatk-bridge2.0-0 libcups2 libdrm2 libgbm1 libatspi2.0-0 libxss1 \
     xvfb xauth \
-    libgtk-3-0 libx11-xcb1 libxfixes3 libxrandr2 libxtst6 libx11-6 libxcomposite1 \
-    libasound2 libdbus-glib-1-2 libpci3 libxss1 libgconf-2-4 libnss3 libatk1.0-0 \
-    libatk-bridge2.0-0 libcups2 libdrm2 libgbm1 libatspi2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -u 1001 myappuser
-USER myappuser
-WORKDIR /home/myappuser/app
-ENV NODE_ENV=production
+RUN useradd -m -u 1001 appuser
+WORKDIR /home/appuser/app
 
-COPY --from=builder /app/package.json /app/package-lock.json* ./
-RUN npm ci --omit=dev
+# Copy installed packages + browser binaries from builder
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+COPY --from=builder /root/.cache/ms-playwright /home/appuser/.cache/ms-playwright
+COPY --from=builder /root/.cache/camoufox /home/appuser/.cache/camoufox
+COPY --from=builder /app/server.py .
 
-COPY --from=builder --chown=myappuser:myappuser /app/dist ./dist
-COPY --from=builder --chown=myappuser:myappuser /root/.cache/camoufox /home/myappuser/.cache/camoufox
+RUN chown -R appuser:appuser /home/appuser
+USER appuser
 
+ENV PYTHONUNBUFFERED=1
+ENV HOME=/home/appuser
 EXPOSE 3000
-ENTRYPOINT ["node", "dist/index.js"]
+
+ENTRYPOINT ["python", "server.py"]
