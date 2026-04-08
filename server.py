@@ -16,14 +16,14 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional, Union
 
-from fastmcp import FastMCP, Image as MCPImage
+from fastmcp import FastMCP
 from playwright.async_api import Page
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 APP_NAME = "camoufox-mcp-server"
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 PORT = int(os.environ.get("PORT", 3000))
 SESSION_TTL_S = int(os.environ.get("SESSION_TTL_MS", 30 * 60 * 1000)) // 1000
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", 10))
@@ -343,11 +343,12 @@ async def inspect_page(
 
 
 @mcp.tool
-async def screenshot(session_id: str, full_page: bool = True) -> MCPImage:
-    """Capture a PNG screenshot of the current page."""
+async def screenshot(session_id: str, full_page: bool = True) -> str:
+    """Capture a PNG screenshot of the current page. Returns base64-encoded PNG."""
     s = _get_session(session_id)
     img_data = await s["page"].screenshot(type="png", full_page=full_page)
-    return MCPImage(data=img_data, format="png")
+    b64 = base64.b64encode(img_data).decode()
+    return f"data:image/png;base64,{b64}"
 
 
 @mcp.tool
