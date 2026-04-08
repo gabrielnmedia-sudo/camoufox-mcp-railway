@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camoufox MCP Server v3.1.0 — Python edition
+Camoufox MCP Server v3.3.0 — Python edition
 Uses the original camoufox Python package for correct fingerprint generation.
 
 Return-type fix: all tools return str (FastMCP serializes str correctly).
@@ -12,6 +12,8 @@ import base64
 import json
 import os
 import random
+import urllib.parse
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional, Union
@@ -23,7 +25,7 @@ from playwright.async_api import Page
 # Config
 # ---------------------------------------------------------------------------
 APP_NAME = "camoufox-mcp-server"
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.3.0"
 PORT = int(os.environ.get("PORT", 3000))
 SESSION_TTL_S = int(os.environ.get("SESSION_TTL_MS", 30 * 60 * 1000)) // 1000
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", 10))
@@ -34,6 +36,7 @@ PROXY_URL = os.environ.get("PROXY_URL")
 PROXY_SERVER = os.environ.get("PROXY_SERVER")
 PROXY_USERNAME = os.environ.get("PROXY_USERNAME")
 PROXY_PASSWORD = os.environ.get("PROXY_PASSWORD")
+CAPSOLVER_API_KEY = os.environ.get("CAPSOLVER_API_KEY")
 
 # ---------------------------------------------------------------------------
 # Session store
@@ -168,15 +171,128 @@ async def _new_session(
         "created_at": _now_iso(),
         "last_used_at": _now_iso(),
         "os": selected_os,
+        "proxy": resolved_proxy,
     }
     return _sessions[sid]
 
 
 # ---------------------------------------------------------------------------
+# Capsolver — auto-solve Cloudflare managed challenges
+# ---------------------------------------------------------------------------
+def _capsolver_post(endpoint: str, payload: dict) -> dict:
+    """Synchronous HTTP POST to Capsolver API."""
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"https://api.capsolver.com/{endpoint}",
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+async def _solve_cf_challenge(page: Page, url: str, proxy_dict: Optional[dict] = None) -> bool:
+    """Solve a Cloudflare managed challenge using Capsolver. Returns True if solved."""
+    if not CAPSOLVER_API_KEY:
+        return False
+    print(f"[Capsolver] Solving CF challenge for {url}")
+
+    # Build proxy string
+    proxy_str = None
+    if proxy_dict:
+        server = proxy_dict.get("server", "")
+        username = proxy_dict.get("username", "")
+        password = proxy_dict.get("password", "")
+        if username and password:
+            if "://" in server:
+                scheme, rest = server.split("://", 1)
+                proxy_str = f"{scheme}://{username}:{password}@{rest}"
+            else:
+                proxy_str = f"http://{username}:{password}@{server}"
+        else:
+            proxy_str = server
+
+    task: dict = {"type": "AntiCloudflareTask", "websiteURL": url}
+    if proxy_str:
+        task["proxy"] = proxy_str
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, _capsolver_post, "createTask", {"clientKey": CAPSOLVER_API_KEY, "task": task}
+        )
+    except Exception as e:
+        print(f"[Capsolver] createTask failed: {e}")
+        return False
+
+    if result.get("errorId"):
+        print(f"[Capsolver] Error: {result.get('errorDescription')}")
+        return False
+
+    task_id = result.get("taskId")
+    if not task_id:
+        return False
+
+    print(f"[Capsolver] Task {task_id} created, polling...")
+    for attempt in range(60):
+        await asyncio.sleep(3)
+        try:
+            res2 = await asyncio.get_event_loop().run_in_executor(
+                None, _capsolver_post, "getTaskResult",
+                {"clientKey": CAPSOLVER_API_KEY, "taskId": task_id}
+            )
+        except Exception:
+            continue
+
+        status = res2.get("status")
+        if status == "ready":
+            solution = res2.get("solution", {})
+            cf_clearance = solution.get("cf_clearance")
+            if cf_clearance:
+                parsed = urllib.parse.urlparse(url)
+                domain = parsed.netloc
+                await page.context.add_cookies([{
+                    "name": "cf_clearance",
+                    "value": cf_clearance,
+                    "domain": domain,
+                    "path": "/",
+                    "httpOnly": True,
+                    "secure": True,
+                }])
+                print(f"[Capsolver] Got cf_clearance, reloading...")
+                await page.reload(wait_until="domcontentloaded", timeout=30000)
+                title = await page.title()
+                print(f"[Capsolver] After reload title: {title}")
+                return "just a moment" not in title.lower()
+        elif status == "failed":
+            print(f"[Capsolver] Task failed: {res2.get('errorDescription')}")
+            return False
+
+    print("[Capsolver] Timed out waiting for solution")
+    return False
+
+
+async def _is_cf_challenge(page: Page) -> bool:
+    """Check if current page is a Cloudflare challenge."""
+    title = await page.title()
+    url = page.url
+    return (
+        "just a moment" in title.lower()
+        or "checking your browser" in title.lower()
+        or "__cf_chl" in url
+        or "cf_chl_rt_tk" in url
+    )
+
+
+# ---------------------------------------------------------------------------
 # Page helpers — all return plain str
 # ---------------------------------------------------------------------------
-async def _navigate(page: Page, url: str, wait_strategy: str, timeout: int):
+async def _navigate(page: Page, url: str, wait_strategy: str, timeout: int,
+                    proxy_dict: Optional[dict] = None):
     await page.goto(url, wait_until=wait_strategy, timeout=timeout)
+    # Auto-solve CF challenge if detected
+    if await _is_cf_challenge(page):
+        await _solve_cf_challenge(page, url, proxy_dict)
 
 
 async def _inspect_elements(page: Page, limit: int = 50) -> list:
@@ -284,7 +400,7 @@ async def create_session(
     )
     try:
         if start_url:
-            await _navigate(s["page"], start_url, wait_strategy, timeout)
+            await _navigate(s["page"], start_url, wait_strategy, timeout, proxy_dict=s.get("proxy"))
         snap = await _page_text(s)
         return f"Created session {s['id']} (os={s['os']}).\n{snap}"
     except Exception:
@@ -320,7 +436,7 @@ async def goto(
 ) -> str:
     """Navigate an existing session to a URL and return the page snapshot."""
     s = _get_session(session_id)
-    await _navigate(s["page"], url, wait_strategy, timeout)
+    await _navigate(s["page"], url, wait_strategy, timeout, proxy_dict=s.get("proxy"))
     return await _page_text(s)
 
 
@@ -580,7 +696,7 @@ async def browse(
         proxy=proxy, enable_cache=enable_cache,
     )
     try:
-        await _navigate(s["page"], url, wait_strategy, timeout)
+        await _navigate(s["page"], url, wait_strategy, timeout, proxy_dict=s.get("proxy"))
         return await _page_text(s, include_html=True)
     except Exception as e:
         return f"Failed to browse {url}: {e}"
@@ -603,7 +719,7 @@ async def browser_task(
     s = await _new_session() if temporary else _get_session(session_id)
     try:
         if start_url:
-            await _navigate(s["page"], start_url, wait_strategy, timeout)
+            await _navigate(s["page"], start_url, wait_strategy, timeout, proxy_dict=s.get("proxy"))
         snap = await _page_text(s, include_html=True)
         return f"Session ID: {s['id']}\nTask: {task}\n{snap}"
     finally:
