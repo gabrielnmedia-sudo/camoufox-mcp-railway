@@ -25,7 +25,7 @@ from playwright.async_api import Page
 # Config
 # ---------------------------------------------------------------------------
 APP_NAME = "camoufox-mcp-server"
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.3.1"
 PORT = int(os.environ.get("PORT", 3000))
 SESSION_TTL_S = int(os.environ.get("SESSION_TTL_MS", 30 * 60 * 1000)) // 1000
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", 10))
@@ -233,18 +233,21 @@ async def _solve_cf_challenge(page: Page, url: str, proxy_dict: Optional[dict] =
     if not task_id:
         return False
 
-    print(f"[Capsolver] Task {task_id} created, polling...")
-    for attempt in range(60):
+    print(f"[Capsolver] Task {task_id} created, polling up to 360s...")
+    for attempt in range(120):
         await asyncio.sleep(3)
         try:
             res2 = await asyncio.get_event_loop().run_in_executor(
                 None, _capsolver_post, "getTaskResult",
                 {"clientKey": CAPSOLVER_API_KEY, "taskId": task_id}
             )
-        except Exception:
+        except Exception as poll_err:
+            print(f"[Capsolver] Poll {attempt+1} error: {poll_err}")
             continue
 
         status = res2.get("status")
+        if attempt % 10 == 9:  # Log every 30s
+            print(f"[Capsolver] Poll {attempt+1}/120: status={status} errorId={res2.get('errorId')}")
         if status == "ready":
             solution = res2.get("solution", {})
             cf_clearance = solution.get("cf_clearance")
@@ -287,12 +290,38 @@ async def _is_cf_challenge(page: Page) -> bool:
 # ---------------------------------------------------------------------------
 # Page helpers — all return plain str
 # ---------------------------------------------------------------------------
+async def _wait_cf_auto_resolve(page: Page, max_wait_s: int = 60) -> bool:
+    """Wait for Cloudflare's challenge JS to auto-complete. Returns True if resolved."""
+    print(f"[CF] Waiting up to {max_wait_s}s for auto-resolve...")
+    try:
+        await page.wait_for_function(
+            """() => {
+                const t = document.title.toLowerCase();
+                return !t.includes('just a moment') && !t.includes('checking your browser') && t.length > 0;
+            }""",
+            timeout=max_wait_s * 1000,
+            polling=2000,
+        )
+        title = await page.title()
+        print(f"[CF] Auto-resolved! Title: {title}")
+        return True
+    except Exception:
+        title = await page.title()
+        print(f"[CF] Did not auto-resolve in {max_wait_s}s. Title: {title}")
+        return False
+
+
 async def _navigate(page: Page, url: str, wait_strategy: str, timeout: int,
                     proxy_dict: Optional[dict] = None):
     await page.goto(url, wait_until=wait_strategy, timeout=timeout)
-    # Auto-solve CF challenge if detected
-    if await _is_cf_challenge(page):
-        await _solve_cf_challenge(page, url, proxy_dict)
+    if not await _is_cf_challenge(page):
+        return
+    print(f"[CF] Challenge detected at {url}")
+    # Step 1: give Camoufox's JS up to 60s to auto-solve
+    if await _wait_cf_auto_resolve(page, max_wait_s=60):
+        return
+    # Step 2: if still blocked, try Capsolver
+    await _solve_cf_challenge(page, url, proxy_dict)
 
 
 async def _inspect_elements(page: Page, limit: int = 50) -> list:
