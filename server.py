@@ -25,7 +25,7 @@ from playwright.async_api import Page
 # Config
 # ---------------------------------------------------------------------------
 APP_NAME = "camoufox-mcp-server"
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.5.1"
 PORT = int(os.environ.get("PORT", 3000))
 SESSION_TTL_S = int(os.environ.get("SESSION_TTL_MS", 30 * 60 * 1000)) // 1000
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", 10))
@@ -906,16 +906,40 @@ async def fetch_cf_page(
             )
         )
         html = resp.text
-        # Extract text content
         import re as _re
-        text = _re.sub(r'<[^>]+>', ' ', html)
-        text = _re.sub(r'\s+', ' ', text).strip()
         status_line = f"HTTP {resp.status_code} — {url}"
         title_m = _re.search(r'<title[^>]*>([^<]+)</title>', html, _re.I)
         title = title_m.group(1).strip() if title_m else "(no title)"
         cf_ok = "just a moment" not in title.lower() and "checking your browser" not in title.lower()
         status_emoji = "✅" if cf_ok else "⚠️  CF still blocking"
-        return f"{status_emoji}\n{status_line}\nTitle: {title}\n\nText ({len(text)} chars):\n{text[:8000]}"
+
+        # Try to extract embedded JSON state (Vue/Nuxt/React SSR pattern)
+        json_state = None
+        for pattern in [
+            r'<script[^>]+id="__NUXT_DATA__"[^>]*>(.*?)</script>',
+            r'window\.__NUXT__\s*=\s*(\{.*?\});?\s*</script>',
+            r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\})',
+            r'<script[^>]+type="application/json"[^>]*>(.*?)</script>',
+        ]:
+            m = _re.search(pattern, html, _re.DOTALL | _re.IGNORECASE)
+            if m:
+                raw_json = m.group(1).strip()
+                if len(raw_json) > 100:
+                    json_state = raw_json[:12000]
+                    break
+
+        # Strip tags for readable text
+        # Remove script/style blocks first
+        clean = _re.sub(r'<script[^>]*>.*?</script>', ' ', html, flags=_re.DOTALL | _re.IGNORECASE)
+        clean = _re.sub(r'<style[^>]*>.*?</style>', ' ', clean, flags=_re.DOTALL | _re.IGNORECASE)
+        text = _re.sub(r'<[^>]+>', ' ', clean)
+        text = _re.sub(r'\s+', ' ', text).strip()
+
+        result = f"{status_emoji}\n{status_line}\nTitle: {title}\n"
+        if json_state:
+            result += f"\nEmbedded JSON state ({len(json_state)} chars):\n{json_state}\n"
+        result += f"\nPage text ({len(text)} chars):\n{text[:6000]}"
+        return result
     except Exception as e:
         return f"⚠️  fetch_cf_page error: {e}"
 
