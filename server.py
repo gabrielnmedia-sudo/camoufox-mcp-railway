@@ -25,7 +25,7 @@ from playwright.async_api import Page
 # Config
 # ---------------------------------------------------------------------------
 APP_NAME = "camoufox-mcp-server"
-APP_VERSION = "3.4.0"
+APP_VERSION = "3.4.1"
 PORT = int(os.environ.get("PORT", 3000))
 SESSION_TTL_S = int(os.environ.get("SESSION_TTL_MS", 30 * 60 * 1000)) // 1000
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", 10))
@@ -250,7 +250,7 @@ async def _solve_cf_challenge(page: Page, url: str, proxy_dict: Optional[dict] =
             print(f"[Capsolver] Poll {attempt+1}/120: status={status} errorId={res2.get('errorId')}")
         if status == "ready":
             solution = res2.get("solution", {})
-            cf_clearance = solution.get("cf_clearance")
+            cf_clearance = solution.get("cf_clearance") or solution.get("cookies", {}).get("cf_clearance")
             if cf_clearance:
                 parsed = urllib.parse.urlparse(url)
                 domain = parsed.netloc
@@ -783,7 +783,7 @@ async def solve_cf(
         print(f"[solve_cf] Capsolver poll: status={status}")
         if status == "ready":
             solution = res2.get("solution", {})
-            cf_clearance = solution.get("cf_clearance")
+            cf_clearance = solution.get("cf_clearance") or solution.get("cookies", {}).get("cf_clearance")
             if cf_clearance:
                 parsed = urllib.parse.urlparse(current_url)
                 domain = parsed.netloc
