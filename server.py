@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Camoufox MCP Server v3.3.0 — Python edition
+Camoufox MCP Server v3.4.0 — Python edition
 Uses the original camoufox Python package for correct fingerprint generation.
 
 Return-type fix: all tools return str (FastMCP serializes str correctly).
@@ -25,7 +25,7 @@ from playwright.async_api import Page
 # Config
 # ---------------------------------------------------------------------------
 APP_NAME = "camoufox-mcp-server"
-APP_VERSION = "3.3.1"
+APP_VERSION = "3.4.0"
 PORT = int(os.environ.get("PORT", 3000))
 SESSION_TTL_S = int(os.environ.get("SESSION_TTL_MS", 30 * 60 * 1000)) // 1000
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", 10))
@@ -313,15 +313,10 @@ async def _wait_cf_auto_resolve(page: Page, max_wait_s: int = 60) -> bool:
 
 async def _navigate(page: Page, url: str, wait_strategy: str, timeout: int,
                     proxy_dict: Optional[dict] = None):
+    """Navigate to URL. CF challenges are NOT auto-solved here to avoid proxy timeout.
+    If a challenge is detected, the snapshot will include CF_CHALLENGE_DETECTED marker.
+    Call the `solve_cf` tool separately to resolve it."""
     await page.goto(url, wait_until=wait_strategy, timeout=timeout)
-    if not await _is_cf_challenge(page):
-        return
-    print(f"[CF] Challenge detected at {url}")
-    # Step 1: give Camoufox's JS up to 60s to auto-solve
-    if await _wait_cf_auto_resolve(page, max_wait_s=60):
-        return
-    # Step 2: if still blocked, try Capsolver
-    await _solve_cf_challenge(page, url, proxy_dict)
 
 
 async def _inspect_elements(page: Page, limit: int = 50) -> list:
@@ -368,9 +363,11 @@ async def _page_text(
     elements = await _inspect_elements(page, interactive_limit)
     html = await page.content() if include_html else None
 
+    cf_blocked = await _is_cf_challenge(session["page"])
     lines = [
         f"URL: {url}",
         f"Title: {title}",
+        *(["⚠️  CF_CHALLENGE_DETECTED — call solve_cf(session_id) to bypass Cloudflare."] if cf_blocked else []),
         f"Visible text: {body_text}",
         f"Interactive elements ({len(elements)}):",
         *[
@@ -701,6 +698,116 @@ async def dismiss_popup(
     snap = await _page_text(s, include_html=False)
     steps_text = "Steps:\n" + "\n".join(f"{i+1}. {st}" for i, st in enumerate(steps))
     return f"{steps_text}\n\n{snap}"
+
+
+@mcp.tool
+async def solve_cf(
+    session_id: str,
+    wait_seconds: int = 30,
+) -> str:
+    """Attempt to solve a Cloudflare managed challenge on the current page.
+    Tries two strategies in sequence:
+    1. Wait up to `wait_seconds` for Camoufox's JS to auto-solve the challenge.
+    2. If still blocked and CAPSOLVER_API_KEY is configured, use Capsolver AntiCloudflareTask.
+
+    Returns the page snapshot with status. Call this after goto/click returns CF_CHALLENGE_DETECTED.
+    May need to be called multiple times — each call waits `wait_seconds` before reporting.
+    Capsolver polling is done in a background task to avoid HTTP timeouts; call again to check."""
+    s = _get_session(session_id)
+    page: Page = s["page"]
+
+    if not await _is_cf_challenge(page):
+        return "No CF challenge detected on current page.\n" + await _page_text(s, include_html=False)
+
+    current_url = page.url
+    print(f"[solve_cf] Challenge on {current_url}, waiting {wait_seconds}s for auto-resolve...")
+
+    # Phase 1: wait for auto-resolve (bounded to wait_seconds so HTTP doesn't timeout)
+    resolved = await _wait_cf_auto_resolve(page, max_wait_s=min(wait_seconds, 60))
+    if resolved:
+        return "✅ CF challenge auto-resolved.\n" + await _page_text(s, include_html=False)
+
+    # Phase 2: try Capsolver (single poll cycle — max ~30s per call to avoid proxy timeout)
+    if not CAPSOLVER_API_KEY:
+        return "⚠️  CF challenge still active. No CAPSOLVER_API_KEY configured.\n" + await _page_text(s, include_html=False)
+
+    print(f"[solve_cf] Starting Capsolver task for {current_url}...")
+    proxy_dict = s.get("proxy")
+
+    # Build proxy string
+    proxy_str = None
+    if proxy_dict:
+        server = proxy_dict.get("server", "")
+        username = proxy_dict.get("username", "")
+        password = proxy_dict.get("password", "")
+        if username and password:
+            if "://" in server:
+                scheme, rest = server.split("://", 1)
+                proxy_str = f"{scheme}://{username}:{password}@{rest}"
+            else:
+                proxy_str = f"http://{username}:{password}@{server}"
+        else:
+            proxy_str = server
+
+    task: dict = {"type": "AntiCloudflareTask", "websiteURL": current_url}
+    if proxy_str:
+        task["proxy"] = proxy_str
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, _capsolver_post, "createTask", {"clientKey": CAPSOLVER_API_KEY, "task": task}
+        )
+    except Exception as e:
+        return f"⚠️  Capsolver createTask failed: {e}\n" + await _page_text(s, include_html=False)
+
+    if result.get("errorId"):
+        return f"⚠️  Capsolver error: {result.get('errorDescription')}\n" + await _page_text(s, include_html=False)
+
+    task_id = result.get("taskId")
+    if not task_id:
+        return f"⚠️  Capsolver returned no taskId: {result}\n" + await _page_text(s, include_html=False)
+
+    print(f"[solve_cf] Capsolver task {task_id} created. Polling up to {wait_seconds}s...")
+    deadline = asyncio.get_event_loop().time() + max(wait_seconds - 5, 10)
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(3)
+        try:
+            res2 = await asyncio.get_event_loop().run_in_executor(
+                None, _capsolver_post, "getTaskResult",
+                {"clientKey": CAPSOLVER_API_KEY, "taskId": task_id}
+            )
+        except Exception:
+            continue
+
+        status = res2.get("status")
+        print(f"[solve_cf] Capsolver poll: status={status}")
+        if status == "ready":
+            solution = res2.get("solution", {})
+            cf_clearance = solution.get("cf_clearance")
+            if cf_clearance:
+                parsed = urllib.parse.urlparse(current_url)
+                domain = parsed.netloc
+                await page.context.add_cookies([{
+                    "name": "cf_clearance",
+                    "value": cf_clearance,
+                    "domain": domain,
+                    "path": "/",
+                    "httpOnly": True,
+                    "secure": True,
+                }])
+                print("[solve_cf] cf_clearance injected, reloading...")
+                await page.reload(wait_until="domcontentloaded", timeout=30000)
+                if not await _is_cf_challenge(page):
+                    return "✅ CF challenge solved via Capsolver.\n" + await _page_text(s, include_html=False)
+                return "⚠️  Capsolver gave cf_clearance but challenge persists.\n" + await _page_text(s, include_html=False)
+            return f"⚠️  Capsolver ready but no cf_clearance in solution: {solution}\n" + await _page_text(s, include_html=False)
+        elif status == "failed":
+            return f"⚠️  Capsolver task failed: {res2.get('errorDescription')}\n" + await _page_text(s, include_html=False)
+
+    return (
+        f"⏳ Capsolver task {task_id} still processing. Call solve_cf again to continue waiting.\n"
+        + await _page_text(s, include_html=False)
+    )
 
 
 @mcp.tool
