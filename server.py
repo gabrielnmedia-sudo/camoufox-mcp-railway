@@ -25,7 +25,7 @@ from playwright.async_api import Page
 # Config
 # ---------------------------------------------------------------------------
 APP_NAME = "camoufox-mcp-server"
-APP_VERSION = "3.4.2"
+APP_VERSION = "3.4.3"
 PORT = int(os.environ.get("PORT", 3000))
 SESSION_TTL_S = int(os.environ.get("SESSION_TTL_MS", 30 * 60 * 1000)) // 1000
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", 10))
@@ -757,9 +757,18 @@ async def solve_cf(
         else:
             proxy_str = server
 
+    # Get current page UA so Capsolver solves with matching UA (CF validates UA+IP)
+    try:
+        page_ua = await page.evaluate("navigator.userAgent")
+    except Exception:
+        page_ua = None
+    print(f"[solve_cf] Page UA: {page_ua}")
+
     task: dict = {"type": "AntiCloudflareTask", "websiteURL": current_url}
     if proxy_str:
         task["proxy"] = proxy_str
+    if page_ua:
+        task["userAgent"] = page_ua
 
     try:
         result = await asyncio.get_event_loop().run_in_executor(
