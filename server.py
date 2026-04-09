@@ -25,7 +25,7 @@ from playwright.async_api import Page
 # Config
 # ---------------------------------------------------------------------------
 APP_NAME = "camoufox-mcp-server"
-APP_VERSION = "3.5.1"
+APP_VERSION = "3.6.0"
 PORT = int(os.environ.get("PORT", 3000))
 SESSION_TTL_S = int(os.environ.get("SESSION_TTL_MS", 30 * 60 * 1000)) // 1000
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", 10))
@@ -826,11 +826,17 @@ async def solve_cf(
 async def fetch_cf_page(
     url: str,
     impersonate: str = "chrome131",
+    warm_url: str = "",
 ) -> str:
-    """Fetch a Cloudflare-protected page using curl_cffi Chrome TLS impersonation.
-    Uses Capsolver to get cf_clearance if CAPSOLVER_API_KEY is set, then fetches
-    with the matching Chrome UA so CF accepts the cookie.
-    Falls back to direct fetch if no Capsolver key (works on some CF tiers).
+    """Fetch a Cloudflare + DataDome-protected page using curl_cffi Chrome TLS impersonation.
+
+    Features:
+    - Chrome TLS fingerprint bypasses Cloudflare on most sites
+    - Uses Capsolver AntiCloudflareTask to get cf_clearance when needed
+    - Detects DataDome 403 challenges and auto-solves via Capsolver DatadomeSliderTask
+    - warm_url: optional URL to pre-load first (e.g. the homepage) to warm the session
+      before fetching the target URL — helps when DataDome tracks navigation history
+
     Returns page text content."""
     try:
         from curl_cffi import requests as cffi_requests
@@ -893,25 +899,139 @@ async def fetch_cf_page(
                     break
 
     proxies = {"https": proxy_str, "http": proxy_str} if proxy_str else None
+    import re as _re
+
+    def _do_get(sess, target_url, extra_cookies=None):
+        merged = dict(cookies) if cookies else {}
+        if extra_cookies:
+            merged.update(extra_cookies)
+        return sess.get(
+            target_url,
+            cookies=merged if merged else None,
+            proxies=proxies,
+            timeout=30,
+            allow_redirects=True,
+        )
+
     try:
+        session = cffi_requests.Session(impersonate=impersonate)
+
+        # ── Optional homepage warm-up (helps DataDome session scoring) ─────
+        if warm_url:
+            try:
+                print(f"[fetch_cf_page] Warming session via {warm_url}")
+                await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: _do_get(session, warm_url)
+                )
+                await asyncio.sleep(1)
+            except Exception as warm_err:
+                print(f"[fetch_cf_page] Warm-up failed (continuing): {warm_err}")
+
+        # ── Initial fetch ──────────────────────────────────────────────────
         resp = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: cffi_requests.get(
-                url,
-                impersonate=impersonate,
-                cookies=cookies if cookies else None,
-                proxies=proxies,
-                timeout=30,
-                allow_redirects=True,
-            )
+            None, lambda: _do_get(session, url)
         )
         html = resp.text
-        import re as _re
-        status_line = f"HTTP {resp.status_code} — {url}"
+
+        # ── DataDome bypass ────────────────────────────────────────────────
+        # Detect DD challenge (403 with "var dd={...}" block)
+        if resp.status_code == 403 and CAPSOLVER_API_KEY:
+            dd_m = _re.search(r"var dd=(\{[^}]+\})", html)
+            if dd_m:
+                dd_raw = dd_m.group(1)
+                _cid     = _re.search(r"'cid':'([^']+)'", dd_raw)
+                _hsh     = _re.search(r"'hsh':'([^']+)'", dd_raw)
+                _s_val   = _re.search(r"'s':(\d+)",        dd_raw)
+                _b_val   = _re.search(r"'b':(\d+)",        dd_raw)
+                _e_val   = _re.search(r"'e':'([^']+)'",    dd_raw)
+                _ck_val  = _re.search(r"'cookie':'([^']+)'", dd_raw)
+                _host_m  = _re.search(r"'host':'([^']+)'", dd_raw)
+
+                if _cid and _hsh and _ck_val:
+                    dd_host = _host_m.group(1) if _host_m else "geo.captcha-delivery.com"
+                    # Construct interstitial captcha URL (format from ct.captcha-delivery.com/i.js)
+                    captcha_url = (
+                        f"https://{dd_host}/interstitial/?"
+                        f"initialCid={urllib.parse.quote(_cid.group(1))}"
+                        f"&hash={urllib.parse.quote(_hsh.group(1))}"
+                        f"&cid={urllib.parse.quote(_ck_val.group(1))}"
+                        f"&referer={urllib.parse.quote(url)}"
+                        + (f"&s={_s_val.group(1)}" if _s_val else "")
+                        + (f"&e={_e_val.group(1)}" if _e_val else "")
+                        + (f"&b={_b_val.group(1)}" if _b_val else "")
+                        + "&dm=cd"
+                    )
+                    print(f"[fetch_cf_page] DataDome challenge detected → Capsolver DatadomeSliderTask")
+                    print(f"[fetch_cf_page] captchaUrl: {captcha_url[:120]}...")
+
+                    dd_task: dict = {
+                        "type": "DatadomeSliderTask",
+                        "websiteURL": url,
+                        "captchaUrl": captcha_url,
+                    }
+                    if proxy_str:
+                        dd_task["proxy"] = proxy_str
+
+                    try:
+                        dd_create = await asyncio.get_event_loop().run_in_executor(
+                            None, _capsolver_post, "createTask",
+                            {"clientKey": CAPSOLVER_API_KEY, "task": dd_task}
+                        )
+                    except Exception as cap_err:
+                        dd_create = {"errorId": 1, "errorDescription": str(cap_err)}
+
+                    dd_task_id = dd_create.get("taskId")
+                    if dd_task_id and not dd_create.get("errorId"):
+                        print(f"[fetch_cf_page] DataDome task {dd_task_id}, polling up to 90s...")
+                        deadline = asyncio.get_event_loop().time() + 90
+                        dd_cookie_val = None
+                        while asyncio.get_event_loop().time() < deadline:
+                            await asyncio.sleep(5)
+                            try:
+                                dd_poll = await asyncio.get_event_loop().run_in_executor(
+                                    None, _capsolver_post, "getTaskResult",
+                                    {"clientKey": CAPSOLVER_API_KEY, "taskId": dd_task_id}
+                                )
+                            except Exception:
+                                continue
+                            if dd_poll.get("status") == "ready":
+                                sol = dd_poll.get("solution", {})
+                                # Capsolver may return "cookie" as "datadome=VALUE" or just VALUE
+                                raw_ck = sol.get("cookie") or sol.get("datadome") or ""
+                                if raw_ck.startswith("datadome="):
+                                    dd_cookie_val = raw_ck[len("datadome="):]
+                                elif raw_ck:
+                                    dd_cookie_val = raw_ck
+                                print(f"[fetch_cf_page] DataDome solved, cookie len={len(dd_cookie_val or '')}")
+                                break
+                            elif dd_poll.get("status") == "failed":
+                                print(f"[fetch_cf_page] DataDome Capsolver failed: {dd_poll.get('errorDescription')}")
+                                break
+
+                        if dd_cookie_val:
+                            resp = await asyncio.get_event_loop().run_in_executor(
+                                None, lambda: _do_get(session, url, {"datadome": dd_cookie_val})
+                            )
+                            html = resp.text
+                            print(f"[fetch_cf_page] Retry with datadome cookie → HTTP {resp.status_code}")
+                        else:
+                            print(f"[fetch_cf_page] DataDome solve failed or no cookie returned")
+                    else:
+                        print(f"[fetch_cf_page] DataDome Capsolver createTask error: {dd_create.get('errorDescription')}")
+
+        # ── Parse and return ───────────────────────────────────────────────
+        status_line = f"HTTP {resp.status_code} — {resp.url}"
         title_m = _re.search(r'<title[^>]*>([^<]+)</title>', html, _re.I)
         title = title_m.group(1).strip() if title_m else "(no title)"
-        cf_ok = "just a moment" not in title.lower() and "checking your browser" not in title.lower()
-        status_emoji = "✅" if cf_ok else "⚠️  CF still blocking"
+        title_lc = title.lower()
+        cf_ok = "just a moment" not in title_lc and "checking your browser" not in title_lc
+        dd_ok = "var dd=" not in html or resp.status_code == 200
+        if not cf_ok:
+            status_emoji = "⚠️  CF still blocking"
+        elif not dd_ok:
+            status_emoji = "⚠️  DataDome still blocking"
+        else:
+            status_emoji = "✅"
 
         # Try to extract embedded JSON state (Vue/Nuxt/React SSR pattern)
         json_state = None
@@ -929,7 +1049,6 @@ async def fetch_cf_page(
                     break
 
         # Strip tags for readable text
-        # Remove script/style blocks first
         clean = _re.sub(r'<script[^>]*>.*?</script>', ' ', html, flags=_re.DOTALL | _re.IGNORECASE)
         clean = _re.sub(r'<style[^>]*>.*?</style>', ' ', clean, flags=_re.DOTALL | _re.IGNORECASE)
         text = _re.sub(r'<[^>]+>', ' ', clean)
@@ -938,7 +1057,7 @@ async def fetch_cf_page(
         result = f"{status_emoji}\n{status_line}\nTitle: {title}\n"
         if json_state:
             result += f"\nEmbedded JSON state ({len(json_state)} chars):\n{json_state}\n"
-        result += f"\nPage text ({len(text)} chars):\n{text[:6000]}"
+        result += f"\nPage text ({len(text)} chars):\n{text[:8000]}"
         return result
     except Exception as e:
         return f"⚠️  fetch_cf_page error: {e}"
