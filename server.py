@@ -25,7 +25,7 @@ from playwright.async_api import Page
 # Config
 # ---------------------------------------------------------------------------
 APP_NAME = "camoufox-mcp-server"
-APP_VERSION = "3.4.1"
+APP_VERSION = "3.4.2"
 PORT = int(os.environ.get("PORT", 3000))
 SESSION_TTL_S = int(os.environ.get("SESSION_TTL_MS", 30 * 60 * 1000)) // 1000
 MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", 10))
@@ -253,19 +253,21 @@ async def _solve_cf_challenge(page: Page, url: str, proxy_dict: Optional[dict] =
             cf_clearance = solution.get("cf_clearance") or solution.get("cookies", {}).get("cf_clearance")
             if cf_clearance:
                 parsed = urllib.parse.urlparse(url)
-                domain = parsed.netloc
+                host = parsed.netloc.split(":")[0]
+                parts = host.split(".")
+                root_domain = "." + ".".join(parts[-2:]) if len(parts) >= 2 else host
                 await page.context.add_cookies([{
                     "name": "cf_clearance",
                     "value": cf_clearance,
-                    "domain": domain,
+                    "domain": root_domain,
                     "path": "/",
                     "httpOnly": True,
                     "secure": True,
                 }])
-                print(f"[Capsolver] Got cf_clearance, reloading...")
-                await page.reload(wait_until="domcontentloaded", timeout=30000)
+                print(f"[Capsolver] Got cf_clearance (domain={root_domain}), navigating to clean URL...")
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                 title = await page.title()
-                print(f"[Capsolver] After reload title: {title}")
+                print(f"[Capsolver] After goto title: {title}")
                 return "just a moment" not in title.lower()
         elif status == "failed":
             print(f"[Capsolver] Task failed: {res2.get('errorDescription')}")
@@ -719,7 +721,13 @@ async def solve_cf(
     if not await _is_cf_challenge(page):
         return "No CF challenge detected on current page.\n" + await _page_text(s, include_html=False)
 
-    current_url = page.url
+    # Strip CF challenge tokens (__cf_chl_rt_tk etc) from URL so Capsolver gets a clean URL
+    _raw_url = page.url
+    _parsed = urllib.parse.urlparse(_raw_url)
+    _qs = urllib.parse.parse_qs(_parsed.query, keep_blank_values=True)
+    _qs = {k: v for k, v in _qs.items() if not k.startswith("__cf_")}
+    _clean_query = urllib.parse.urlencode(_qs, doseq=True)
+    current_url = urllib.parse.urlunparse(_parsed._replace(query=_clean_query))
     print(f"[solve_cf] Challenge on {current_url}, waiting {wait_seconds}s for auto-resolve...")
 
     # Phase 1: wait for auto-resolve (bounded to wait_seconds so HTTP doesn't timeout)
@@ -786,17 +794,21 @@ async def solve_cf(
             cf_clearance = solution.get("cf_clearance") or solution.get("cookies", {}).get("cf_clearance")
             if cf_clearance:
                 parsed = urllib.parse.urlparse(current_url)
-                domain = parsed.netloc
+                # CF sets cf_clearance on the root domain (e.g. .whitepages.com)
+                host = parsed.netloc.split(":")[0]  # strip port if any
+                parts = host.split(".")
+                root_domain = "." + ".".join(parts[-2:]) if len(parts) >= 2 else host
                 await page.context.add_cookies([{
                     "name": "cf_clearance",
                     "value": cf_clearance,
-                    "domain": domain,
+                    "domain": root_domain,
                     "path": "/",
                     "httpOnly": True,
                     "secure": True,
                 }])
-                print("[solve_cf] cf_clearance injected, reloading...")
-                await page.reload(wait_until="domcontentloaded", timeout=30000)
+                print(f"[solve_cf] cf_clearance injected (domain={root_domain}), navigating to clean URL...")
+                # Navigate to clean URL (not reload) to avoid __cf_chl_rt_tk re-challenge
+                await page.goto(current_url, wait_until="domcontentloaded", timeout=30000)
                 if not await _is_cf_challenge(page):
                     return "✅ CF challenge solved via Capsolver.\n" + await _page_text(s, include_html=False)
                 return "⚠️  Capsolver gave cf_clearance but challenge persists.\n" + await _page_text(s, include_html=False)
